@@ -2,15 +2,18 @@ from kafka import KafkaConsumer, KafkaProducer
 from src.kafka_to_kafka.yaml_config import load_config
 import logging
 import json
+import time
 
 config = load_config()
 KAFKA_TOPIC = config["KAFKA_TOPIC"]
+LOCAL_KAFKA_TOPIC = config["LOCAL_KAFKA_TOPIC"]
 SOURCE_BOOTSTRAP_SERVERS = config["SOURCE_BOOTSTRAP_SERVERS"]
 LOCAL_BOOTSTRAP_SERVERS = config["LOCAL_BOOTSTRAP_SERVERS"]
 SECURITY_PROTOCOL = config["SECURITY_PROTOCOL"]
 SASL_MECHANISM = config["SASL_MECHANISM"]
 SASL_PLAIN_USERNAME = config["SASL_PLAIN_USERNAME"]
 SASL_PLAIN_PASSWORD = config["SASL_PLAIN_PASSWORD"]
+BATCH_SIZE = 500
 
 #
 # SASL configuration
@@ -30,8 +33,8 @@ def collect_message():
             KAFKA_TOPIC,
             bootstrap_servers = SOURCE_BOOTSTRAP_SERVERS,
             auto_offset_reset='earliest',
-            group_id='kafka_to_kafka_consumer',
-            enable_auto_commit=True,
+            group_id='ktok_v2',
+            enable_auto_commit=False,
             value_deserializer=lambda m: json.loads(m.decode('ascii')),
             **get_sasl_config()
         )
@@ -48,18 +51,65 @@ def collect_message():
     except Exception as e:
         logging.exception(f"Error when connecting to kafka server")
 
-    count = 0
 
     # Consuming message and produce to local kafka
+    batch_counter = 0
     try:
-        for message in consumer:
-            producer.send('product_view', message.value)
-            producer.flush()
-            count+=1
-            logging.info(f"Have saved {count}")
+        while True:
+            messages = consumer.poll(timeout_ms=5000)
+
+            if not messages:
+                logging.warning("No new messages")
+                continue
+
+            for topic_partition, messages in messages.items():
+                for message in messages:
+                    try:
+                        producer.send(LOCAL_KAFKA_TOPIC, value=message.value)
+                        batch_counter += 1
+                    except Exception as e:
+                        logging.exception(f"Error sending message to producer buffer")
+
+            if batch_counter >= BATCH_SIZE or (not messages and batch_counter > 0):
+                try:
+                    producer.flush()
+                    consumer.commit()
+
+                    logging.info(f"Successfully produced and committed {batch_counter} data")
+                    batch_counter = 0
+
+                except Exception as e:
+                    logging.exception(f"Error processing batch. Retrying in next loop...")
+                    time.sleep(5)
+
+
     except Exception as e:
-        logging.exception(f"Interruption")
+        logging.info(f"Error: {e}")
     finally:
+        if batch_counter > 0:
+            try:
+                producer.flush()
+                consumer.commit()
+
+                logging.info(f"Successfully produced and committed {batch_counter} data")
+            except Exception as e:
+                logging.exception(f"Error when sending message to buffer")
+
         consumer.close()
         producer.close()
         logging.info(f"Have done")
+
+
+    # Consuming message and produce to local kafka
+    # try:
+    #     for message in consumer:
+    #         producer.send('product_view', message.value)
+    #         producer.flush()
+    #         count+=1
+    #         logging.info(f"Have saved {count}")
+    # except Exception as e:
+    #     logging.exception(f"Interruption")
+    # finally:
+    #     consumer.close()
+    #     producer.close()
+    #     logging.info(f"Have done")
